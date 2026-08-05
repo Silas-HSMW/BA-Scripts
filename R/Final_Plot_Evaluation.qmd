@@ -33,9 +33,23 @@ eval_label <- "application"   # z.B. "application", "application_os", "os", "cli
 k_fixed <- 4
 
 balance_n_per_label <- 2500
-balance_seed <- 313
+balance_seed <- 42
 min_relevant_share <- 0.05
 set.seed(balance_seed)
+
+
+# ------------------------------------------------------------
+# ------------ Wichtig: nur für unbalancierten datensatz version
+#-------------------------------------------------------------
+set.seed(420)
+
+readr::read_csv("combined_results.csv", show_col_types = FALSE) %>%
+  dplyr::slice_sample(n = 10000) %>%
+  readr::write_csv("combined_results_sample_10000.csv")
+
+input_file <- "combined_results_sample_10000.csv"
+# ------------------------------------------------------------
+# ------------------------------------------------------------
 
 flow_numeric_features <- c(
   "flow_duration",
@@ -134,8 +148,11 @@ make_label_cluster_score_table <- function(data, cluster_col, label_col, min_rel
     ) %>%
     arrange(desc(label_total), label)
 }
+# -------------------- Hinweis
+# für unbalanciert hier balance = FALSE
+# --------------------
 prepare_analysis_data <- function(input_file, selected_endpoint_filter, eval_label, flow_features,
-                                  use_ja4 = FALSE, extra_cols = character(), balance = TRUE) {
+                                  use_ja4 = FALSE, extra_cols = character(), balance = FALSE) {
   
   df <- readr::read_csv(input_file, show_col_types = FALSE)
   
@@ -161,7 +178,10 @@ prepare_analysis_data <- function(input_file, selected_endpoint_filter, eval_lab
         TRUE ~ selected_endpoint
       )
     ) %>%
-    filter(selected_endpoint == selected_endpoint_filter) %>%
+    # -------------------- Hinweis
+    # für ungefiltertes set hier "filter(...)" auskommentieren
+    # --------------------
+    # filter(selected_endpoint == selected_endpoint_filter) %>%
     select(
       all_of(eval_label),
       all_of(flow_features),
@@ -269,7 +289,10 @@ run_flow_only <- function() {
     eval_label = eval_label,
     flow_features = flow_features,
     use_ja4 = FALSE,
-    balance = TRUE
+    # -------------------- Hinweis
+    # für unbalanciert hier balance = FALSE
+    # --------------------
+    balance = FALSE
   )
   
   flow_dist <- make_flow_distance(analysis_df)
@@ -291,7 +314,10 @@ run_ja4_only <- function() {
     eval_label = eval_label,
     flow_features = flow_features,
     use_ja4 = TRUE,
-    balance = TRUE
+    # -------------------- Hinweis
+    # für unbalanciert hier balance = FALSE
+    # --------------------
+    balance = FALSE
   )
   
   ja4_dist <- make_ja4_distance(analysis_df)
@@ -306,6 +332,346 @@ run_ja4_only <- function() {
   )
 }
 ```
+
+
+ja4 heat map
+```{r}
+# ------------------------------------------------------------
+# Dominanter Fingerprint je Anwendung
+#
+# Für jedes Label wird der am häufigsten vorkommende
+# Fingerprint als Hauptfingerprint ausgewählt.
+#
+# TP: Label und Hauptfingerprint stimmen überein
+# FP: anderes Label verwendet denselben Hauptfingerprint
+# FN: Label verwendet einen anderen Fingerprint
+# ------------------------------------------------------------
+
+evaluate_dominant_fingerprint <- function(
+    data,
+    eval_label,
+    fingerprint_col,
+    top_n_fingerprints = 15
+) {
+  
+  # ----------------------------------------------------------
+  # Daten bereinigen
+  # ----------------------------------------------------------
+  
+  fingerprint_data <- data %>%
+    transmute(
+      label = as.character(.data[[eval_label]]),
+      fingerprint = as.character(.data[[fingerprint_col]])
+    ) %>%
+    filter(
+      !is.na(label),
+      !is.na(fingerprint),
+      label != "",
+      fingerprint != "",
+      label != "NA",
+      fingerprint != "NA",
+      label != "<NA>",
+      fingerprint != "<NA>"
+    )
+  
+  # ----------------------------------------------------------
+  # Häufigkeit jedes Fingerprints innerhalb jedes Labels
+  # ----------------------------------------------------------
+  
+  fingerprint_counts <- fingerprint_data %>%
+    count(
+      label,
+      fingerprint,
+      name = "n"
+    )
+  
+  # ----------------------------------------------------------
+  # Häufigster Fingerprint je Label
+  #
+  # Bei Gleichstand wird deterministisch der alphabetisch
+  # erste Fingerprint ausgewählt.
+  # ----------------------------------------------------------
+  
+  main_fingerprints <- fingerprint_counts %>%
+    arrange(
+      label,
+      desc(n),
+      fingerprint
+    ) %>%
+    group_by(label) %>%
+    slice_head(n = 1) %>%
+    ungroup() %>%
+    rename(
+      main_fingerprint = fingerprint,
+      tp_in_main_cluster = n
+    )
+  
+  # Anzahl aller Samples je Label
+  label_totals <- fingerprint_data %>%
+    count(
+      label,
+      name = "label_total"
+    )
+  
+  # Gesamtzahl aller Samples je Fingerprint
+  fingerprint_totals <- fingerprint_data %>%
+    count(
+      fingerprint,
+      name = "fingerprint_total"
+    )
+  
+  # Anzahl unterschiedlicher Fingerprints je Label
+  fingerprints_observed <- fingerprint_data %>%
+    group_by(label) %>%
+    summarise(
+      fingerprints_observed = n_distinct(fingerprint),
+      .groups = "drop"
+    )
+  
+  # ----------------------------------------------------------
+  # Precision, Recall und F1
+  # ----------------------------------------------------------
+  
+  score_table <- main_fingerprints %>%
+    left_join(
+      label_totals,
+      by = "label"
+    ) %>%
+    left_join(
+      fingerprint_totals,
+      by = c("main_fingerprint" = "fingerprint")
+    ) %>%
+    left_join(
+      fingerprints_observed,
+      by = "label"
+    ) %>%
+    mutate(
+      fp_in_main_cluster =
+        fingerprint_total - tp_in_main_cluster,
+      
+      fn_outside_main_cluster =
+        label_total - tp_in_main_cluster,
+      
+      main_cluster_precision = if_else(
+        tp_in_main_cluster + fp_in_main_cluster > 0,
+        tp_in_main_cluster /
+          (tp_in_main_cluster + fp_in_main_cluster),
+        NA_real_
+      ),
+      
+      main_cluster_recall = if_else(
+        tp_in_main_cluster + fn_outside_main_cluster > 0,
+        tp_in_main_cluster /
+          (tp_in_main_cluster + fn_outside_main_cluster),
+        NA_real_
+      ),
+      
+      main_cluster_f1 = if_else(
+        main_cluster_precision + main_cluster_recall > 0,
+        2 *
+          main_cluster_precision *
+          main_cluster_recall /
+          (main_cluster_precision + main_cluster_recall),
+        NA_real_
+      ),
+      
+      label_concentration = main_cluster_recall
+    ) %>%
+    transmute(
+      method = paste0(
+        "dominant_",
+        fingerprint_col
+      ),
+      label,
+      label_total,
+      
+      # Für die Vergleichbarkeit mit der Clustering-Tabelle
+      # wird der Hauptfingerprint als main_cluster bezeichnet.
+      main_cluster = main_fingerprint,
+      cluster_total = fingerprint_total,
+      
+      tp_in_main_cluster,
+      fp_in_main_cluster,
+      fn_outside_main_cluster,
+      main_cluster_precision,
+      main_cluster_recall,
+      main_cluster_f1,
+      label_concentration,
+      fingerprints_observed
+    )
+  
+  # ----------------------------------------------------------
+  # Fingerprints für die Heatmap auswählen
+  # ----------------------------------------------------------
+  
+  top_fingerprints <- fingerprint_data %>%
+    count(
+      fingerprint,
+      sort = TRUE
+    ) %>%
+    slice_head(
+      n = top_n_fingerprints
+    ) %>%
+    pull(fingerprint)
+  
+  # Die Hauptfingerprints werden immer dargestellt,
+  # selbst wenn sie nicht unter den globalen Top-N liegen.
+  displayed_fingerprints <- union(
+    top_fingerprints,
+    score_table$main_cluster
+  )
+  
+  # ----------------------------------------------------------
+  # Tabellendaten der Heatmap
+  # ----------------------------------------------------------
+  
+  distribution_table <- fingerprint_data %>%
+    mutate(
+      fingerprint_grouped = if_else(
+        fingerprint %in% displayed_fingerprints,
+        fingerprint,
+        "Other"
+      )
+    ) %>%
+    count(
+      label,
+      fingerprint_grouped,
+      name = "n"
+    ) %>%
+    group_by(label) %>%
+    mutate(
+      label_total = sum(n),
+      share_in_label = n / label_total
+    ) %>%
+    ungroup()
+  
+  # Reihenfolge anhand der Gesamthäufigkeit
+  fingerprint_order <- distribution_table %>%
+    group_by(fingerprint_grouped) %>%
+    summarise(
+      total = sum(n),
+      .groups = "drop"
+    ) %>%
+    arrange(total) %>%
+    pull(fingerprint_grouped)
+  
+  distribution_table <- distribution_table %>%
+    mutate(
+      fingerprint_grouped = factor(
+        fingerprint_grouped,
+        levels = fingerprint_order
+      )
+    )
+  
+  # ----------------------------------------------------------
+  # Heatmap
+  # ----------------------------------------------------------
+  
+  p <- ggplot(
+    distribution_table,
+    aes(
+      x = label,
+      y = fingerprint_grouped,
+      fill = share_in_label
+    )
+  ) +
+    geom_tile(
+      color = "white",
+      linewidth = 0.5
+    ) +
+    geom_text(
+      aes(
+        label = paste0(
+          n,
+          "\n",
+          scales::percent(
+            share_in_label,
+            accuracy = 1
+          )
+        )
+      ),
+      size = 2.8,
+      color = "white",
+      fontface = "bold",
+      lineheight = 0.9
+    ) +
+    scale_fill_continuous(
+      labels = scales::percent_format()
+    ) +
+    coord_fixed() +
+    labs(
+      title = paste0(
+        "Verteilung von ",
+        fingerprint_col,
+        " nach ",
+        eval_label
+      ),
+      x = eval_label,
+      y = fingerprint_col,
+      fill = paste(
+        "Anteil innerhalb",
+        eval_label
+      )
+    ) +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(
+        angle = 45,
+        hjust = 1,
+        vjust = 1
+      )
+    )
+  
+  attr(p, "suggested_width") <- max(
+    10,
+    length(unique(distribution_table$label)) * 2.2
+  )
+  
+  attr(p, "suggested_height") <- max(
+    7,
+    length(unique(distribution_table$fingerprint_grouped)) * 0.8
+  )
+  
+  # ----------------------------------------------------------
+  # Ergebnisse gemeinsam zurückgeben
+  # ----------------------------------------------------------
+  
+  list(
+    score_table = score_table,
+    distribution_table = distribution_table,
+    plot = p
+  )
+}
+```
+
+```{r}
+ja4_assignment_df <- prepare_analysis_data(
+  input_file = input_file,
+  selected_endpoint_filter = selected_endpoint_filter,
+  eval_label = eval_label,
+  flow_features = flow_features,
+  extra_cols = "ja4",
+  # -------------------- Hinweis
+  # für unbalanciert hier balance = FALSE
+  # --------------------
+  balance = FALSE
+)
+ja4_assignment_result <- evaluate_dominant_fingerprint(
+  data = ja4_assignment_df,
+  eval_label = eval_label,
+  fingerprint_col = "ja4",
+  top_n_fingerprints = 15
+)
+ja4_assignment_result$score_table
+mean(ja4_assignment_result$score_table$main_cluster_f1, na.rm = TRUE)
+```
+```{r}
+p_ja4_assignment <- ja4_assignment_result$plot
+
+p_ja4_assignment
+```
+
+
 
 ```{r}
 # ------------------------------------------------------------
@@ -457,7 +823,10 @@ run_ja4r_only <- function(prefix_weight = 0.25) {
     eval_label = eval_label,
     flow_features = flow_features,
     extra_cols = "ja4_r",
-    balance = TRUE
+    # -------------------- Hinweis
+    # für unbalanciert hier balance = FALSE
+    # --------------------
+    balance = FALSE
   )
   
   ja4r_dist <- make_ja4r_distance(
@@ -489,6 +858,8 @@ Block: Flow-only-Auswertung
 label_result_table_flow <- run_flow_only()
 
 label_result_table_flow
+mean(label_result_table_flow$main_cluster_f1, na.rm = TRUE)
+
 ```
 
 ```{r}
@@ -497,6 +868,8 @@ label_result_table_ja4r <- run_ja4r_only(
 )
 
 label_result_table_ja4r
+mean(label_result_table_ja4r$main_cluster_f1, na.rm = TRUE)
+
 ```
 Block: JA4-only-Auswertung
   Führt Clustering nur mit JA4-Distanz aus
@@ -508,6 +881,7 @@ Block: JA4-only-Auswertung
 label_result_table_ja4 <- run_ja4_only()
 
 label_result_table_ja4
+mean(label_result_table_ja4$main_cluster_f1, na.rm = TRUE)
 ```
 Block: Flow+JA4-Vorbereitung und Funktion
   Bereitet gemeinsamen Datensatz für kombinierte Flow+JA4-Auswertung vor
@@ -538,7 +912,7 @@ normalize_dist_01 <- function(d, q = 0.95) {
   as.dist(m_norm)
 }
 
-ja4r_prefix_weight <- 0.25
+ja4r_prefix_weight <- 0.25 # wie viel das erste Drittel zählt
 
 flow_tls_analysis_df <- prepare_analysis_data(
   input_file = input_file,
@@ -546,7 +920,10 @@ flow_tls_analysis_df <- prepare_analysis_data(
   eval_label = eval_label,
   flow_features = flow_features,
   extra_cols = c("ja4", "ja4_r"),
-  balance = TRUE
+  # -------------------- Hinweis
+  # für unbalanciert hier balance = FALSE
+  # --------------------
+  balance = FALSE
 )
 
 flow_tls_flow_dist <- make_flow_distance(flow_tls_analysis_df)
@@ -753,8 +1130,9 @@ geom_line(
   labs(
     title = "Main-Cluster-F1 nach JA4_r-Gewichtung",
     subtitle = paste0(
-      "Endpoint: ",
-      selected_endpoint_filter,
+      "Ungefilter und Unbalanciert",
+      #"Endpoint: ",
+      #selected_endpoint_filter,
       ", PAM mit k = ",
       k_fixed,
       ", Bewertung gegen ",
@@ -1041,9 +1419,119 @@ make_ja3_jaccard_distance <- function(
   
   as.dist(complete_distance_matrix)
 }
+
 ```
 
+```{r}
+ja3_section_names <- c(
+  "tls_version",
+  "cipher_suites",
+  "extensions",
+  "supported_groups",
+  "ec_point_formats"
+)
 
+split_ja3_full_sections <- function(ja3_values) {
+  
+  parsed_sections <- lapply(
+    as.character(ja3_values),
+    function(current_ja3) {
+      
+      parts <- strsplit(
+        current_ja3,
+        split = ",",
+        fixed = TRUE
+      )[[1]]
+      
+      if (length(parts) > 5) {
+        stop(
+          paste0(
+            "Ungültiger JA3_full-Wert mit mehr als fünf Abschnitten: ",
+            current_ja3
+          )
+        )
+      }
+      
+      parts <- c(
+        parts,
+        rep("", 5 - length(parts))
+      )
+      
+      trimws(parts)
+    }
+  )
+  
+  section_matrix <- do.call(
+    rbind,
+    parsed_sections
+  )
+  
+  colnames(section_matrix) <- ja3_section_names
+  
+  section_matrix
+}
+
+ja3_analysis_df <- prepare_analysis_data(
+  input_file = input_file,
+  selected_endpoint_filter = selected_endpoint_filter,
+  eval_label = eval_label,
+  flow_features = flow_features,
+  extra_cols = "ja3_full",
+  # -------------------- Hinweis
+  # für unbalanciert hier balance = FALSE
+  # --------------------
+  balance = FALSE
+)
+
+run_ja3_full <- function(
+    distance_method = c("levenshtein", "jaccard")
+) {
+  
+  distance_method <- match.arg(distance_method)
+  
+  ja3_distance <- switch(
+    distance_method,
+    
+    "levenshtein" = make_ja3_levenshtein_distance(
+      data = ja3_analysis_df,
+      ja3_col = "ja3_full"
+    ),
+    
+    "jaccard" = make_ja3_jaccard_distance(
+      data = ja3_analysis_df,
+      ja3_col = "ja3_full"
+    )
+  )
+  
+  run_pam_score(
+    data = ja3_analysis_df,
+    distance_matrix = ja3_distance,
+    cluster_name = paste0(
+      "cluster_ja3_",
+      distance_method
+    ),
+    eval_label = eval_label,
+    k_fixed = k_fixed,
+    min_relevant_share = min_relevant_share
+  ) %>%
+    mutate(
+      ja3_method = distance_method,
+      .before = 1
+    )
+}
+
+run_ja3_jaccard <- function() {
+  run_ja3_full(
+    distance_method = "jaccard"
+  )
+}
+
+run_ja3_levenshtein <- function() {
+  run_ja3_full(
+    distance_method = "levenshtein"
+  )
+}
+```
 
 
 
@@ -1051,12 +1539,16 @@ make_ja3_jaccard_distance <- function(
 label_result_table_ja3_jaccard <- run_ja3_jaccard()
 
 label_result_table_ja3_jaccard
+mean(label_result_table_ja3_jaccard$main_cluster_f1, na.rm = TRUE)
+
 ```
 
 ```{r}
 label_result_table_ja3_levenshtein <- run_ja3_levenshtein()
 
 label_result_table_ja3_levenshtein
+mean(label_result_table_ja3_levenshtein$main_cluster_f1, na.rm = TRUE)
+
 ```
 ```{r}
 # ------------------------------------------------------------
@@ -1070,6 +1562,9 @@ flow_ja3_analysis_df <- prepare_analysis_data(
   eval_label = eval_label,
   flow_features = flow_features,
   extra_cols = "ja3_full",
+  # -------------------- Hinweis
+  # für unbalanciert hier balance = FALSE
+  # --------------------
   balance = TRUE
 )
 
@@ -1302,6 +1797,21 @@ p_f1_flow_ja3_jaccard_weight
 ```
 
 ```{r}
+
+table_flow_ja4 <- run_flow_ja4(
+  0.175,
+  ja4_version = "ja4"
+)
+table_flow_ja4
+mean(table_flow_ja4$main_cluster_f1, na.rm = TRUE)
+
+
+table_flow_ja4r <- run_flow_ja4(
+  0.7,
+  ja4_version = "ja4_r"
+)
+table_flow_ja4r
+mean(table_flow_ja4r$main_cluster_f1, na.rm = TRUE)
 
 ```
 
