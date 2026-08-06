@@ -21,6 +21,12 @@ install.packages(c(
   "ggplot2"
 ))
 ```
+Genaue Versionen welche im Rahmen der Arbeit verwendet wurden:
+```
+tidyverse   cluster     purrr     readr     dplyr     tidyr   stringr   ggplot2 
+  "2.0.0" "2.1.8.2"   "1.2.2"   "2.2.0"   "1.2.1"   "1.3.2"   "1.6.0"   "4.0.3" 
+```
+
 
 ### Ungefilterter Datensatz
 
