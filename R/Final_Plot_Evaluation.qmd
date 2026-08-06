@@ -2,30 +2,79 @@
 title: "Final_Plot_Evaluation"
 format: html
 ---
+## 0. Alle daten zu csv zusammenfügen
+Hinzufügen der datein und erstellen der os und application_os spalte
+```{r}
+library(jsonlite)
+library(dplyr)
+library(purrr)
+library(readr)
 
-##################### Beginn Clustering
+# Ordner mit den Ergebnisdateien
+folder_path <- "/home/silas/PycharmProjects/BA/correlated_flows.jsonl/"
 
-Block: Gemeinsamer Setup- und Funktionsblock
-  Definiert zentrale Parameter für die Auswertung
-  Legt Label, Endpoint, Clusteranzahl und Balancing fest
-  Definiert die verwendeten Flow-Merkmale
-  Enthält Hilfsfunktionen für Balancing, Datenaufbereitung und Bewertung
-  Bereitet eine einheitliche labelbasierte Clusterbewertung vor
-  Berechnet Precision, Recall und F1 je Label über den jeweiligen Hauptcluster
-  Definiert Funktionen zur Flow-Distanz und JA4-Distanz
-  Kapselt PAM-Clustering und Ergebnistabelle in wiederverwendbare Funktionen
-  Grundlage für alle folgenden Auswertungsblöcke
+files <- list.files(
+  path = folder_path,
+  pattern = "\\.jsonl$",
+  full.names = TRUE
+)
+
+df <- map_dfr(files, function(file_path) {
+  data <- stream_in(file(file_path), verbose = FALSE)
+  # erweitert spalten um weitere analysen zu ermoeglichen. 
+  data <- data %>%
+    mutate(source_file = basename(file_path))
+
+  if ("client_id" %in% names(data)) {
+    data <- data %>%
+      mutate(
+        os = case_when(
+          client_id %in% c("windows-client-01", "windows-client-02") ~ "win",
+          client_id %in% c("linux-mint-client-01", "linux-arch-client-01") ~ "linux",
+          TRUE ~ NA_character_
+        )
+      )
+  } else {
+    data <- data %>%
+      mutate(os = NA_character_)
+  }
+
+  if ("application" %in% names(data)) {
+    data <- data %>%
+      mutate(
+        application_os = if_else(
+          !is.na(application) & application != "" & !is.na(os) & os != "",
+          paste0(application, "_", os),
+          NA_character_
+        )
+      )
+  } else {
+    data <- data %>%
+      mutate(application_os = NA_character_)
+  }
+
+  data
+})
+
+write_csv(df, "combined_results.csv")
+```
+
+
+## 1. Gemeinsame Konfiguration und Grundfunktionen
+
+Der folgende Block definiert die globale Konfiguration, die verwendeten Flow-Merkmale, die Datenaufbereitung, die Distanzfunktionen, die Hauptcluster-Bewertung und die gemeinsamen PAM-Wrapper.
 
 
 ```{r}
+# Benötigte Pakete für Datenmanipulation, Visualisierung und PAM-Clustering.
 library(tidyverse)
 library(cluster)
 
 
-# ------------------------------------------------------------
 # Einstellungen
 # ------------------------------------------------------------
 
+# Globale Eingabedatei und Zielkonfiguration der Auswertung.
 input_file <- "combined_results.csv"
 selected_endpoint_filter <- "/index.html"
 
@@ -33,24 +82,25 @@ eval_label <- "application"   # z.B. "application", "application_os", "os", "cli
 k_fixed <- 4
 
 balance_n_per_label <- 2500
-balance_seed <- 42
+balance_seed <- 42   # seed entsprechend verändern
 min_relevant_share <- 0.05
 set.seed(balance_seed)
 
 
-# ------------------------------------------------------------
-# ------------ Wichtig: nur für unbalancierten datensatz version
-#-------------------------------------------------------------
-set.seed(420)
+# -------------------- Hinweis!!!
+# Stichprobenerzeugung für die unbalancierte Datensatzversion. andernfalls auskommentieren
+#set.seed(balance_seed)
 
-readr::read_csv("combined_results.csv", show_col_types = FALSE) %>%
-  dplyr::slice_sample(n = 10000) %>%
-  readr::write_csv("combined_results_sample_10000.csv")
+# Erzeugt eine reproduzierbare Stichprobe von 10 000 Verbindungen und schreibt sie in eine eigene CSV-Datei
+#readr::read_csv("combined_results.csv", show_col_types = FALSE) %>%
+#  dplyr::slice_sample(n = 10000) %>%
+#  readr::write_csv("combined_results_sample_10000.csv")
 
-input_file <- "combined_results_sample_10000.csv"
-# ------------------------------------------------------------
+#input_file <- "combined_results_sample_10000.csv"
+
 # ------------------------------------------------------------
 
+# Numerische Flow-Merkmale. dieser werden vor der Distanzberechnung logarithmiert und standardisiert
 flow_numeric_features <- c(
   "flow_duration",
   "packet_count_total",
@@ -64,6 +114,7 @@ flow_numeric_features <- c(
   "mean_packet_size_server_to_client"
 )
 
+# Verhältnismerkmale werden nicht durch Logarithmierung standardisiert.
 flow_ratio_features <- c(
   "bytes_ratio_client_to_server",
   "packets_ratio_client_to_server"
@@ -72,8 +123,12 @@ flow_ratio_features <- c(
 flow_features <- c(flow_numeric_features, flow_ratio_features)
 
 # ------------------------------------------------------------
-# Hilfsfunktionen
+# ------------------    Hilfsfunktionen
 # ------------------------------------------------------------
+
+
+
+# Funktion sammelt für jedes ausreichend große Label dieselbe Anzahl Beobachtungen. Balancierter Datensatz, reduziert auf genau n_per_label Zeilen für Lable. gibt es nicht genug beobachtungen pro lable entfallen die Lables
 
 balance_by_label <- function(data, label_col, n_per_label, seed = balance_seed) {
   set.seed(seed)
@@ -85,29 +140,36 @@ balance_by_label <- function(data, label_col, n_per_label, seed = balance_seed) 
     slice_sample(n = n_per_label) %>%
     ungroup()
 }
-
+# -----------------------------------------------------------------------------
+# funktion ermittelt für Label den Hauptcluster und berechnet daraus Precision, Recall und F1.
 make_label_cluster_score_table <- function(data, cluster_col, label_col, min_relevant_share = 0.05) {
-  
+  # Anzahl der Vorkommen jeder Label-Cluster-Kombination bestimmen
   label_cluster_distribution <- data %>%
     transmute(
       label = as.character(.data[[label_col]]),
       cluster = factor(.data[[cluster_col]])
     ) %>%
+    # entfernen ungültiger werte
     filter(!is.na(label), label != "", !is.na(cluster)) %>%
+    # Label Cluster kombinationen zählen
     dplyr::count(label, cluster, name = "n") %>%
     group_by(label) %>%
     mutate(
+      # label anzahl
       label_total = sum(n),
+      # Anteil des Labels in diesem Cluster
       share_of_label = n / label_total,
+      # Anzahl aller beobachteten Cluster
       clusters_observed = n_distinct(cluster),
+      # Anzahl relevanter Cluster (mindestens min_relevant_share)
       clusters_relevant = sum(share_of_label >= min_relevant_share)
     ) %>%
     ungroup()
-  
+  # Gesamtgröße jedes Clusters bestimmen
   cluster_sizes <- label_cluster_distribution %>%
     group_by(cluster) %>%
     summarise(cluster_total = sum(n), .groups = "drop")
-  
+  # Clustergrößen ergänzen und für jedes Label den größten Cluster auswählen
   label_cluster_distribution %>%
     left_join(cluster_sizes, by = "cluster") %>%
     group_by(label) %>%
@@ -115,10 +177,15 @@ make_label_cluster_score_table <- function(data, cluster_col, label_col, min_rel
     slice_head(n = 1) %>%
     ungroup() %>%
     mutate(
+      # Hauptcluster des Labels
       main_cluster = cluster,
+      # anzahl True Positive
       tp_in_main_cluster = n,
+      # anzahl False Positives
       fp_in_main_cluster = cluster_total - tp_in_main_cluster,
+      # anzahl False Negatives
       fn_outside_main_cluster = label_total - tp_in_main_cluster,
+      # Evaluationswerte
       main_cluster_recall = tp_in_main_cluster / label_total,
       main_cluster_precision = tp_in_main_cluster / cluster_total,
       main_cluster_f1 = if_else(
@@ -127,9 +194,11 @@ make_label_cluster_score_table <- function(data, cluster_col, label_col, min_rel
           (main_cluster_precision + main_cluster_recall),
         NA_real_
       ),
+      # Zusätzliche Kennzahlen
       label_concentration = main_cluster_recall,
       label_fragmentation_relevant = clusters_relevant
     ) %>%
+    # relevante Ergebnisspalten ausgeben
     select(
       label,
       label_total,
@@ -148,27 +217,32 @@ make_label_cluster_score_table <- function(data, cluster_col, label_col, min_rel
     ) %>%
     arrange(desc(label_total), label)
 }
+# -----------------------------------------------------------------------------
+# Liest die Daten ein, prüft und bereinigt die benötigten Spalten und balanciert optional nach Label.
+
 # -------------------- Hinweis
-# für unbalanciert hier balance = FALSE
+# für unbalanciert balance = FALSE
 # --------------------
 prepare_analysis_data <- function(input_file, selected_endpoint_filter, eval_label, flow_features,
-                                  use_ja4 = FALSE, extra_cols = character(), balance = FALSE) {
-  
+                                  use_ja4 = FALSE, extra_cols = character(), balance = TRUE) {
+  # Datei einlesen
   df <- readr::read_csv(input_file, show_col_types = FALSE)
-  
+  # wenn JA4 verwendet wird spalte hinzufügen. (so gelößt das funktion unterschiedlich genutzt werden kann)
   if (use_ja4) {
     extra_cols <- union(extra_cols, "ja4")
   }
-  
+  # Alle für die Analyse benötigten Spalten zusammenstellen
   needed_cols <- unique(c("selected_endpoint", eval_label, flow_features, extra_cols))
   
+  # prüft ob spalten existieren
   missing_cols <- setdiff(needed_cols, names(df))
   if (length(missing_cols) > 0) {
     stop(paste("Fehlende Spalten:", paste(missing_cols, collapse = ", ")))
   }
-  
+  # Ab hier eigendliche Datensatzvorbereitung
   analysis_df <- df %>%
     mutate(
+      # gemach da sonst probleme mit filtern entstehen die auf "" gesetzt werden müssten
       selected_endpoint = as.character(selected_endpoint),
       selected_endpoint = case_when(
         is.na(selected_endpoint) ~ "/index.html",
@@ -179,15 +253,17 @@ prepare_analysis_data <- function(input_file, selected_endpoint_filter, eval_lab
       )
     ) %>%
     # -------------------- Hinweis
-    # für ungefiltertes set hier "filter(...)" auskommentieren
+    # Aktueller Zustand: keine Endpoint-Filterung; die Filterzeile bleibt auskommentiert.
     # --------------------
-    # filter(selected_endpoint == selected_endpoint_filter) %>%
+    filter(selected_endpoint == selected_endpoint_filter) %>%
+    # übernimmt nur relevante Spalten
     select(
       all_of(eval_label),
       all_of(flow_features),
       all_of(extra_cols)
     ) %>%
     mutate(
+      # Datentyp festlegen
       across(all_of(eval_label), as.character),
       across(all_of(flow_features), as.numeric)
     ) %>%
@@ -197,15 +273,19 @@ prepare_analysis_data <- function(input_file, selected_endpoint_filter, eval_lab
         ~ if_else(is.finite(.x), .x, NA_real_)
       )
     ) %>%
+    # ungültige lables entferen 
     filter(
       !is.na(.data[[eval_label]]),
       .data[[eval_label]] != ""
     ) %>%
+    # fehlende FLow fehler vermeiden
     drop_na(all_of(flow_features))
   
   if (length(extra_cols) > 0) {
     analysis_df <- analysis_df %>%
+      # Zusatzspalten als Zeichenketten behandeln
       mutate(across(all_of(extra_cols), as.character)) %>%
+      # fehlerbehandlung
       filter(
         if_all(
           all_of(extra_cols),
@@ -213,7 +293,7 @@ prepare_analysis_data <- function(input_file, selected_endpoint_filter, eval_lab
         )
       )
   }
-  
+  # wenn oben balance==TRUE dann wird der datensatz pro Lable ausbalanciert
   if (balance) {
     analysis_df <- balance_by_label(
       analysis_df,
@@ -222,58 +302,65 @@ prepare_analysis_data <- function(input_file, selected_endpoint_filter, eval_lab
       seed = balance_seed
     )
   }
-  
+  # rückgabe vorverarbeitete daten
   analysis_df
 }
-
+# -----------------------------------------------------------------------------
+# Standardisiert die Flow-Merkmale und berechnet daraus die euklidische Distanzmatrix.
 make_flow_distance <- function(data) {
   flow_feature_matrix <- data %>%
     mutate(
+      # werte  logarithmieren und anschließend z-standardisieren
       across(
         all_of(flow_numeric_features),
         ~ as.numeric(scale(log1p(.x)))
       ),
+      # Verhältnismerkmale ausschließlich z-standardisieren (seperat da nicht logarithmiert)
       across(
         all_of(flow_ratio_features),
         ~ as.numeric(scale(.x))
       )
     ) %>%
+    # Nur die für die Distanzberechnung verwendeten Flow-Merkmale übernehmen. 
     select(all_of(flow_features)) %>%
     as.data.frame()
-  
+  # wenn Merkmale konstat bleiben, werden sie entfernt
   non_constant_cols <- apply(flow_feature_matrix, 2, function(x) {
     current_sd <- sd(x, na.rm = TRUE)
     is.finite(current_sd) && current_sd > 0
   })
   
   flow_feature_matrix <- flow_feature_matrix[, non_constant_cols, drop = FALSE]
-  
+  # euklidische Distanzmatrik berechnen
   dist(flow_feature_matrix, method = "euclidean")
 }
-
+# -----------------------------------------------------------------------------
+# Erzeugt eine diskrete Distanzmatrix für JA4-Werte.
 make_ja4_distance <- function(data) {
   ja4_values <- data$ja4
-  
+  #  Paarweise diskrete distanz bilden
   ja4_dist_matrix <- outer(
     ja4_values,
     ja4_values,
     FUN = function(a, b) as.numeric(a != b)
   )
-  
+  # Distanzmatrix in ein "dist"-Objekt umwandeln
   as.dist(ja4_dist_matrix)
 }
-
+# -----------------------------------------------------------------------------
+# Führt PAM mit der vorgegebenen Clusterzahl aus und bewertet die Cluster labelweise.
 run_pam_score <- function(data, distance_matrix, cluster_name, eval_label, k_fixed, min_relevant_share) {
-  
+  # pam durchführen mit übergebener distanzmatrix
   pam_fit <- cluster::pam(
     distance_matrix,
     k = k_fixed,
     diss = TRUE
   )
-  
+  # Die berechneten Clusterzuordnungen dem Datensatz hinzufügen
   result_df <- data %>%
     mutate("{cluster_name}" := factor(pam_fit$clustering))
   
+  # Cluster anhand der Ground-Truth-Labels bewerten
   make_label_cluster_score_table(
     data = result_df,
     cluster_col = cluster_name,
@@ -281,8 +368,9 @@ run_pam_score <- function(data, distance_matrix, cluster_name, eval_label, k_fix
     min_relevant_share = min_relevant_share
   )
 }
-
+# -----------------------------------------------------------------------------
 run_flow_only <- function() {
+  # analysedatensatz erstellen
   analysis_df <- prepare_analysis_data(
     input_file = input_file,
     selected_endpoint_filter = selected_endpoint_filter,
@@ -290,13 +378,13 @@ run_flow_only <- function() {
     flow_features = flow_features,
     use_ja4 = FALSE,
     # -------------------- Hinweis
-    # für unbalanciert hier balance = FALSE
+    # für unbalanciert balance = FALSE.
     # --------------------
-    balance = FALSE
+    balance = TRUE
   )
-  
+  # Distanzmatrix auf Basis der Flow-Merkmale berechnen
   flow_dist <- make_flow_distance(analysis_df)
-  
+  # pam score berechnen
   run_pam_score(
     data = analysis_df,
     distance_matrix = flow_dist,
@@ -307,7 +395,10 @@ run_flow_only <- function() {
   )
 }
 
+
+# Führt die Baseline-Auswertung ausschließlich mit den Flow-Merkmalen aus.
 run_ja4_only <- function() {
+  # analysedatensatz erstellen
   analysis_df <- prepare_analysis_data(
     input_file = input_file,
     selected_endpoint_filter = selected_endpoint_filter,
@@ -315,13 +406,13 @@ run_ja4_only <- function() {
     flow_features = flow_features,
     use_ja4 = TRUE,
     # -------------------- Hinweis
-    # für unbalanciert hier balance = FALSE
+    # für unbalanciert balance = FALSE.
     # --------------------
-    balance = FALSE
+    balance = TRUE
   )
-  
+  # Distanzmatrix auf Basis der Flow-Merkmale berechnen
   ja4_dist <- make_ja4_distance(analysis_df)
-  
+  # pam score berechnen
   run_pam_score(
     data = analysis_df,
     distance_matrix = ja4_dist,
@@ -334,19 +425,12 @@ run_ja4_only <- function() {
 ```
 
 
-ja4 heat map
+## 2. Dominanter JA4-Fingerprint je Anwendung
+
+Dieser Abschnitt bewertet den häufigsten JA4-Fingerprint jeder Anwendung als einfache Referenzzuordnung und erzeugt zusätzlich eine Heatmap der Fingerprint-Verteilung.
 ```{r}
 # ------------------------------------------------------------
-# Dominanter Fingerprint je Anwendung
-#
-# Für jedes Label wird der am häufigsten vorkommende
-# Fingerprint als Hauptfingerprint ausgewählt.
-#
-# TP: Label und Hauptfingerprint stimmen überein
-# FP: anderes Label verwendet denselben Hauptfingerprint
-# FN: Label verwendet einen anderen Fingerprint
-# ------------------------------------------------------------
-
+# Dominanter Fingerprint je Anwendung Berechnen
 evaluate_dominant_fingerprint <- function(
     data,
     eval_label,
@@ -354,10 +438,7 @@ evaluate_dominant_fingerprint <- function(
     top_n_fingerprints = 15
 ) {
   
-  # ----------------------------------------------------------
   # Daten bereinigen
-  # ----------------------------------------------------------
-  
   fingerprint_data <- data %>%
     transmute(
       label = as.character(.data[[eval_label]]),
@@ -374,10 +455,7 @@ evaluate_dominant_fingerprint <- function(
       fingerprint != "<NA>"
     )
   
-  # ----------------------------------------------------------
-  # Häufigkeit jedes Fingerprints innerhalb jedes Labels
-  # ----------------------------------------------------------
-  
+  # Häufigkeit jedes Fingerprints innerhalb aller lable berechnen
   fingerprint_counts <- fingerprint_data %>%
     count(
       label,
@@ -385,13 +463,7 @@ evaluate_dominant_fingerprint <- function(
       name = "n"
     )
   
-  # ----------------------------------------------------------
-  # Häufigster Fingerprint je Label
-  #
-  # Bei Gleichstand wird deterministisch der alphabetisch
-  # erste Fingerprint ausgewählt.
-  # ----------------------------------------------------------
-  
+  # Haeufigsten Fingerprint fuer jede anwendung bestimmen
   main_fingerprints <- fingerprint_counts %>%
     arrange(
       label,
@@ -427,11 +499,7 @@ evaluate_dominant_fingerprint <- function(
       fingerprints_observed = n_distinct(fingerprint),
       .groups = "drop"
     )
-  
-  # ----------------------------------------------------------
-  # Precision, Recall und F1
-  # ----------------------------------------------------------
-  
+  # Evaluationsmaße bestimmen. Ergebnsse an Matrix anfuegen
   score_table <- main_fingerprints %>%
     left_join(
       label_totals,
@@ -451,21 +519,21 @@ evaluate_dominant_fingerprint <- function(
       
       fn_outside_main_cluster =
         label_total - tp_in_main_cluster,
-      
+      # precision
       main_cluster_precision = if_else(
         tp_in_main_cluster + fp_in_main_cluster > 0,
         tp_in_main_cluster /
           (tp_in_main_cluster + fp_in_main_cluster),
         NA_real_
       ),
-      
+      # recall
       main_cluster_recall = if_else(
         tp_in_main_cluster + fn_outside_main_cluster > 0,
         tp_in_main_cluster /
           (tp_in_main_cluster + fn_outside_main_cluster),
         NA_real_
       ),
-      
+      # f1
       main_cluster_f1 = if_else(
         main_cluster_precision + main_cluster_recall > 0,
         2 *
@@ -485,8 +553,7 @@ evaluate_dominant_fingerprint <- function(
       label,
       label_total,
       
-      # Für die Vergleichbarkeit mit der Clustering-Tabelle
-      # wird der Hauptfingerprint als main_cluster bezeichnet.
+      
       main_cluster = main_fingerprint,
       cluster_total = fingerprint_total,
       
@@ -500,10 +567,7 @@ evaluate_dominant_fingerprint <- function(
       fingerprints_observed
     )
   
-  # ----------------------------------------------------------
-  # Fingerprints für die Heatmap auswählen
-  # ----------------------------------------------------------
-  
+  # Fingerprints für die Heatmap auswählen. es werden nur die top n genommen sodass diese funktion Theoretisch auch auf z.b. ja3 oder ja4 mit deutlich mehr fingerprints ausgefuehrt werden kann
   top_fingerprints <- fingerprint_data %>%
     count(
       fingerprint,
@@ -514,17 +578,13 @@ evaluate_dominant_fingerprint <- function(
     ) %>%
     pull(fingerprint)
   
-  # Die Hauptfingerprints werden immer dargestellt,
-  # selbst wenn sie nicht unter den globalen Top-N liegen.
+  # Die Hauptfingerprints werden immer dargestellt, auch wenn sie nicht in top n sind
   displayed_fingerprints <- union(
     top_fingerprints,
     score_table$main_cluster
   )
   
-  # ----------------------------------------------------------
-  # Tabellendaten der Heatmap
-  # ----------------------------------------------------------
-  
+  # tabelle fuer heatmap
   distribution_table <- fingerprint_data %>%
     mutate(
       fingerprint_grouped = if_else(
@@ -545,7 +605,7 @@ evaluate_dominant_fingerprint <- function(
     ) %>%
     ungroup()
   
-  # Reihenfolge anhand der Gesamthäufigkeit
+  # Reihenfolge anhand gesamtaufkommen
   fingerprint_order <- distribution_table %>%
     group_by(fingerprint_grouped) %>%
     summarise(
@@ -563,10 +623,7 @@ evaluate_dominant_fingerprint <- function(
       )
     )
   
-  # ----------------------------------------------------------
-  # Heatmap
-  # ----------------------------------------------------------
-  
+  # Heatmap plotten 
   p <- ggplot(
     distribution_table,
     aes(
@@ -632,10 +689,7 @@ evaluate_dominant_fingerprint <- function(
     length(unique(distribution_table$fingerprint_grouped)) * 0.8
   )
   
-  # ----------------------------------------------------------
-  # Ergebnisse gemeinsam zurückgeben
-  # ----------------------------------------------------------
-  
+  # Ergebnisse gemeinsam ausgeben (in qmd nicht wirklich relevant)
   list(
     score_table = score_table,
     distribution_table = distribution_table,
@@ -645,6 +699,7 @@ evaluate_dominant_fingerprint <- function(
 ```
 
 ```{r}
+# Bereitet den unbalancierten Datensatz für die dominante JA4-Referenz vor.
 ja4_assignment_df <- prepare_analysis_data(
   input_file = input_file,
   selected_endpoint_filter = selected_endpoint_filter,
@@ -652,10 +707,11 @@ ja4_assignment_df <- prepare_analysis_data(
   flow_features = flow_features,
   extra_cols = "ja4",
   # -------------------- Hinweis
-  # für unbalanciert hier balance = FALSE
+  # für unbalanciert balance = FALSE
   # --------------------
-  balance = FALSE
+  balance = TRUE
 )
+# Berechnet Referenzmetriken und Heatmap-Daten für den dominanten JA4-Fingerprint.
 ja4_assignment_result <- evaluate_dominant_fingerprint(
   data = ja4_assignment_df,
   eval_label = eval_label,
@@ -665,7 +721,9 @@ ja4_assignment_result <- evaluate_dominant_fingerprint(
 ja4_assignment_result$score_table
 mean(ja4_assignment_result$score_table$main_cluster_f1, na.rm = TRUE)
 ```
+
 ```{r}
+# Ausgabe
 p_ja4_assignment <- ja4_assignment_result$plot
 
 p_ja4_assignment
@@ -673,30 +731,43 @@ p_ja4_assignment
 
 
 
+
+## 3. JA4_r-Distanz und JA4_r-only-Auswertung
+
+Dieser Abschnitt zerlegt JA4_r in seine strukturellen Bestandteile, berechnet die angepasste Distanz und kapselt die TLS-only-Auswertung.
+
 ```{r}
 # ------------------------------------------------------------
 # JA4_r: strukturierte Distanz und Clustering-Funktion
 # ------------------------------------------------------------
 
+
+
+# Zerlegt einen JA4_r-Abschnitt in bereinigte und eindeutige Token
 tokenize_ja4r_section <- function(x) {
+  # als string behandelt
   x <- as.character(x)
-  
+  # Ungültige oder leere Werte verwerfen
   if (is.na(x) || x == "" || x == "NA" || x == "<NA>") {
     return(character())
   }
-  
+   # JA4_r-Abschnitt anhand von Komma oder Bindestrich in einzelne Tokens zerlegen
   tokens <- stringr::str_split(x, "[,\\-]")[[1]]
+  # Leerzeichen an Anfang und Ende entfernen
   tokens <- stringr::str_trim(tokens)
+  # Ungültige und leere Tokens entfernen
   tokens <- tokens[!is.na(tokens)]
   tokens <- tokens[tokens != ""]
   tokens <- tokens[!(tokens %in% c("NA", "<NA>"))]
-  
+  # Doppelte Werte entfernen und eindeutige Tokens zurückgeben (kennwerte einzigartig)
   unique(tokens)
 }
-
+# ------------------------------------------------------------
+# Zerlegt JA4_r-Werte in Präfix und die nachfolgenden Tokenabschnitte.
 parse_ja4r_vector <- function(ja4r_values) {
+  # JA4_r-Werte anhand des Unterstrichs in einzelne Abschnitte zerlegen
   split_values <- stringr::str_split(as.character(ja4r_values), "_")
-  
+  # Erstes JA4_r element besteht aus lesbarem Teil und hashwerten
   prefix <- purrr::map_chr(split_values, function(parts) {
     if (length(parts) >= 1) {
       parts[1]
@@ -704,13 +775,14 @@ parse_ja4r_vector <- function(ja4r_values) {
       ""
     }
   })
-  
+  # Das lesbare Präfix wird nicht als Token betrachtet und daher abgezogen
   max_sections <- max(purrr::map_int(split_values, length)) - 1
-  
+  # Anschließend wird jeder abschnitt in Tokens zerlegt
   token_sections <- purrr::map(seq_len(max_sections), function(section_index) {
     purrr::map(split_values, function(parts) {
+      # Index bestimmen
       target_index <- section_index + 1
-      
+      #wenn existent token extrahieren, sonst leere menge
       if (length(parts) >= target_index) {
         tokenize_ja4r_section(parts[target_index])
       } else {
@@ -718,90 +790,95 @@ parse_ja4r_vector <- function(ja4r_values) {
       }
     })
   })
-  
+  # Präfixe und Token gemeinsam zurückgeben. Token als liste der einzelnen abschnitte
   list(
     prefix = prefix,
     token_sections = token_sections
   )
 }
-
+# -----------------------------------------------------------------------------
+# Kodiert eine Liste von Tokenmengen als diskrete  Beobachtung-Token-Matrix.
 make_token_matrix <- function(token_sets) {
+  # vokabular der Matrix erstellen. Jeder vorkommende Token ist seine eigende Dimension
   vocabulary <- sort(unique(unlist(token_sets, use.names = FALSE)))
-  
+  # fehler für fehlede token
   if (length(vocabulary) == 0) {
     return(matrix(0, nrow = length(token_sets), ncol = 0))
   }
-  
+  # Matrix erstellen. Zeilen sind beobachtungen; Spalten sind Tokens.  Default wert == 0 (Wichtig: hier ist 0 noch keine Distanz!!)
   token_matrix <- matrix(
     0,
     nrow = length(token_sets),
     ncol = length(vocabulary),
     dimnames = list(NULL, vocabulary)
   )
-  
+  # Für jede Beobachtungen die enthaltenen Toeken markieren
   for (i in seq_along(token_sets)) {
     current_tokens <- token_sets[[i]]
-    
+    # wenn vorhanden == 1
     if (length(current_tokens) > 0) {
       token_matrix[i, current_tokens] <- 1
     }
   }
-  
+  # ausgabe toekn matrix
   token_matrix
 }
 
+# -----------------------------------------------------------------------------
+# Berechnet die paarweisen Jaccard-Distanzen zwischen Tokenmengen.
 make_jaccard_distance_matrix <- function(token_sets) {
+  # Tokenset als matrix kodieren
   token_matrix <- make_token_matrix(token_sets)
   n <- length(token_sets)
-  
+  # Fehler wenn keine Token vorhanden
   if (ncol(token_matrix) == 0) {
     return(matrix(0, nrow = n, ncol = n))
   }
-  
+  # anzahl gemeinsamer token
   intersection_matrix <- tcrossprod(token_matrix)
+  # Anzahl der token pro beobachung
   token_counts <- rowSums(token_matrix)
-  
+  # anzahl aller unterschiedlichen Token
   union_matrix <- outer(token_counts, token_counts, FUN = "+") - intersection_matrix
   
   distance_matrix <- matrix(0, nrow = n, ncol = n)
-  
+  # nur pare mit min einem token
   valid_pairs <- union_matrix > 0
-  
-  distance_matrix[valid_pairs] <-
-    1 - intersection_matrix[valid_pairs] / union_matrix[valid_pairs]
-  
+  # Aenlichkeit bestimmen und Aenlichkeit zu Distanz mit 1-x
+  distance_matrix[valid_pairs] <- 1 - intersection_matrix[valid_pairs] / union_matrix[valid_pairs]
+  # ausgabe matrix
   distance_matrix
 }
 
-make_ja4r_distance <- function(data, ja4r_col = "ja4_r", prefix_weight = 0.25) {
-  
+# -----------------------------------------------------------------------------
+# Kombiniert Präfix und abschnittsweise Jaccard-Distanzen zu einer JA4_r-Distanz. Anmerkung: prefix gewicht scheint nahezu keinen unterschied bei der berechnung zu machen. 
+make_ja4r_distance <- function(data, ja4r_col = "ja4_r", prefix_weight = 0.2) {
+  # Prüfen, ob die JA4_r-Spalte im Datensatz vorhanden ist
   if (!(ja4r_col %in% names(data))) {
     stop(paste("Spalte fehlt:", ja4r_col))
   }
-  
+  # Prüfen, ob das Gewicht des Präfixes im gültigen Bereich liegt
   if (prefix_weight < 0 || prefix_weight > 1) {
     stop("prefix_weight muss zwischen 0 und 1 liegen.")
   }
-  
   parsed_ja4r <- parse_ja4r_vector(data[[ja4r_col]])
-  
+  # Binäre Distanzmatrix für die Präfixe berechnen (bei distanz ist 0 == identisch)
   prefix_distance_matrix <- outer(
     parsed_ja4r$prefix,
     parsed_ja4r$prefix,
     FUN = function(a, b) as.numeric(a != b)
   )
-  
+  # Anzahl der vorhandenen JA4_r-Sektionen bestimmen
   section_count <- length(parsed_ja4r$token_sections)
-  
+  # sollten keine anderen gülitgen bestandteile bestehen nur prefix vergleichen 
   if (section_count == 0) {
     diag(prefix_distance_matrix) <- 0
     return(as.dist(prefix_distance_matrix))
   }
-  
+  # präfixverrechung it Token mittels liniarer interpolation
   section_weight <- (1 - prefix_weight) / section_count
-  
   combined_distance_matrix <- prefix_weight * prefix_distance_matrix
-  
+  # for jedes Tokenset eine distanz berechnen
   for (current_section in parsed_ja4r$token_sections) {
     current_section_distance <- make_jaccard_distance_matrix(current_section)
     
@@ -809,14 +886,15 @@ make_ja4r_distance <- function(data, ja4r_col = "ja4_r", prefix_weight = 0.25) {
       combined_distance_matrix +
       section_weight * current_section_distance
   }
-  
+  # Distanzen zu sich selbst ist 0
   diag(combined_distance_matrix) <- 0
-  
+  # für kompatibilität als dist objekt zurück
   as.dist(combined_distance_matrix)
 }
-
+# -----------------------------------------------------------------------------
+# Führt die Clustering-Auswertung ausschließlich mit der strukturierten JA4_r-Distanz aus, als hauptfunktion
 run_ja4r_only <- function(prefix_weight = 0.25) {
-  
+  # datensatz vorbereiten
   analysis_df <- prepare_analysis_data(
     input_file = input_file,
     selected_endpoint_filter = selected_endpoint_filter,
@@ -824,17 +902,18 @@ run_ja4r_only <- function(prefix_weight = 0.25) {
     flow_features = flow_features,
     extra_cols = "ja4_r",
     # -------------------- Hinweis
-    # für unbalanciert hier balance = FALSE
+    # Aktuelle Auswertung: unbalanciert (balance = FALSE).
     # --------------------
     balance = FALSE
   )
   
+  # Berechnet die angepasste JA4_r-Distanz 
   ja4r_dist <- make_ja4r_distance(
     data = analysis_df,
     ja4r_col = "ja4_r",
     prefix_weight = prefix_weight
   )
-  
+  # pam clustering aufdistanzmatrix ausführen und Evaluationsmaße ausrechnen
   run_pam_score(
     data = analysis_df,
     distance_matrix = ja4r_dist,
@@ -848,21 +927,24 @@ run_ja4r_only <- function(prefix_weight = 0.25) {
 
 
 
-Block: Flow-only-Auswertung
-  Führt Clustering nur mit Flow-Merkmalen aus
-  Verwendet dieselbe Datenaufbereitung und Bewertung wie die anderen Varianten
-  Dient als Baseline ohne TLS-Fingerprint-Information
-  Ergebnis zeigt, wie stark Anwendungen allein durch Verbindungsmerkmale gruppiert werden
+## 4. Flow-only-Auswertung
+
+Die Flow-only-Auswertung bildet die Baseline ohne TLS-Fingerprint-Informationen. Datenaufbereitung, PAM-Clustering und Hauptcluster-Bewertung entsprechen den übrigen Varianten.
 
 ```{r}
+# Führt die Flow-only-Baseline aus und gibt Tabelle sowie mittleren F1-Wert aus.
 label_result_table_flow <- run_flow_only()
-
+# ausgabe
 label_result_table_flow
 mean(label_result_table_flow$main_cluster_f1, na.rm = TRUE)
 
 ```
 
+
+## 5. JA4_r-only-Ergebnisse
+
 ```{r}
+# Führt die JA4_r-only-Auswertung mit dem festgelegten Präfixgewicht aus.
 label_result_table_ja4r <- run_ja4r_only(
   prefix_weight = 0.25
 )
@@ -871,49 +953,47 @@ label_result_table_ja4r
 mean(label_result_table_ja4r$main_cluster_f1, na.rm = TRUE)
 
 ```
-Block: JA4-only-Auswertung
-  Führt Clustering nur mit JA4-Distanz aus
-  Gleicher JA4 bedeutet Distanz 0, unterschiedlicher JA4 bedeutet Distanz 1
-  Dient als TLS-Fingerprint-basierter Vergleich zur Flow-Baseline
-  Ergebnis zeigt, wie gut JA4 allein Anwendungen strukturiert
+## 6. JA4-only-Auswertung
+
+Die JA4-only-Auswertung verwendet ausschließlich die binäre JA4-Distanz: identische JA4-Werte erhalten Distanz 0, unterschiedliche JA4-Werte Distanz 1.
 
 ```{r}
+# Führt die JA4-only-Auswertung aus.
 label_result_table_ja4 <- run_ja4_only()
-
+# ausgabe
 label_result_table_ja4
 mean(label_result_table_ja4$main_cluster_f1, na.rm = TRUE)
 ```
-Block: Flow+JA4-Vorbereitung und Funktion
-  Bereitet gemeinsamen Datensatz für kombinierte Flow+JA4-Auswertung vor
-  Nutzt nur Verbindungen mit gültigem JA4
-  Berechnet Flow-Distanz und normalisiert sie auf vergleichbare Skala
-  Berechnet JA4-Distanz separat
-  Speichert beide Distanzmatrizen für wiederholte Nutzung
-  Definiert run_flow_ja4(ja4_weight)
-  ja4_weight = 0 entspricht Flow-only auf JA4-gefiltertem Datensatz
-  ja4_weight = 1 entspricht JA4-only auf demselben Datensatz
-  Dazwischen gewichtete Kombination beider Distanzen
+## 7. Kombination von Flow- und JA4-Distanzen
+
+Dieser Abschnitt bereitet einen gemeinsamen Datensatz für die gewichtete Kombination vor. ja4_weight = 0 entspricht Flow-only auf dem gefilterten Datensatz, ja4_weight = 1 entspricht TLS-only auf demselben Datensatz
 
 ```{r}
 # ------------------------------------------------------------
 # Flow + JA4 / JA4_r: gemeinsame Vorbereitung und Funktion
 # ------------------------------------------------------------
 
+# kappt Distanzwerte am gewählten Quantil und skaliert sie auf den Bereich von 0 bis 1
 normalize_dist_01 <- function(d, q = 0.95) {
+  # zu Matrix umwandeln
   m <- as.matrix(d)
+  # Nur oberes Dreieck behandeln (distanz a zu b ist gleich wie von b zu a). ohne diagonale
   upper_values <- m[upper.tri(m)]
+  # quail brestimmen
   cap <- quantile(upper_values, probs = q, na.rm = TRUE)
-  
+  # Fehlerausgabe wenn nicht bestimmt werden kann 
   if (is.na(cap) || cap == 0) {
-    stop("Distanzmatrix kann nicht normalisiert werden: cap ist 0 oder NA.")
+    stop("Distanzmatrix fehler: cap ist 0 oder NA.")
   }
-  
+  # Werte normalisieren somit liegen alle nicht diskreten werte zwischen 0 und 1
   m_norm <- pmin(m, cap) / cap
+  # zurückgeben als dist
   as.dist(m_norm)
 }
+# wie viel das erste Drittel zählt
+ja4r_prefix_weight <- 0.25 
 
-ja4r_prefix_weight <- 0.25 # wie viel das erste Drittel zählt
-
+# Erstellt datensatz. Enthält ja4 und ja4_r
 flow_tls_analysis_df <- prepare_analysis_data(
   input_file = input_file,
   selected_endpoint_filter = selected_endpoint_filter,
@@ -921,20 +1001,21 @@ flow_tls_analysis_df <- prepare_analysis_data(
   flow_features = flow_features,
   extra_cols = c("ja4", "ja4_r"),
   # -------------------- Hinweis
-  # für unbalanciert hier balance = FALSE
+  # Für unbalanciert balance = FALSE
   # --------------------
-  balance = FALSE
+  balance = TRUE
 )
-
+# Flow normalisieren/Skalieren
 flow_tls_flow_dist <- make_flow_distance(flow_tls_analysis_df)
+# Quantilanpassungen vornehmen sodass wertebereich gleich zu Jaccard distanz
 flow_tls_flow_dist_01 <- normalize_dist_01(flow_tls_flow_dist, q = 0.95)
-
+# als matrix
 flow_tls_flow_matrix <- as.matrix(flow_tls_flow_dist_01)
-
+# JA4 distanzen berechnen und als matrix abspeichern
 flow_tls_ja4_matrix <- as.matrix(
   make_ja4_distance(flow_tls_analysis_df)
 )
-
+# JA4_r Jaccard distanzen berechnen und als matrix abspeichern
 flow_tls_ja4r_matrix <- as.matrix(
   make_ja4r_distance(
     data = flow_tls_analysis_df,
@@ -943,26 +1024,28 @@ flow_tls_ja4r_matrix <- as.matrix(
   )
 )
 
+# -----------------------------------------------------------------------------
+# Kombiniert Flow- und JA4- beziehungsweise JA4_r-Distanzen mit dem gewählten Gewicht und führt PAM aus.
 run_flow_ja4 <- function(ja4_weight, ja4_version = c("ja4", "ja4_r")) {
-  
+  # ja version festlegen (so können beide mit dieser funktion aufgerufen werden)
   ja4_version <- match.arg(ja4_version)
-  
+  # fehlerprüfung ob ja gewicht sinn macht
   if (length(ja4_weight) != 1 || ja4_weight < 0 || ja4_weight > 1) {
-    stop("ja4_weight muss genau ein Wert zwischen 0 und 1 sein.")
+    stop("ja4_weight muss ein Wert zwischen 0 und 1 sein.")
   }
-  
+  # passt die matrix entsprechend der gewählten JA4/JA4_r variante an
   tls_matrix <- switch(
     ja4_version,
     "ja4" = flow_tls_ja4_matrix,
     "ja4_r" = flow_tls_ja4r_matrix
   )
-  
+  # liniare interpolation verwenden um gewichte zusammenzufügen 
   combined_dist_matrix <-
     (1 - ja4_weight) * flow_tls_flow_matrix +
     ja4_weight * tls_matrix
-  
+  # für weitere schritte zu dist umwandeln
   combined_dist <- as.dist(combined_dist_matrix)
-  
+  # pam durchführen und scores berechnen. version und gewichtung in matrix spalten abspeicher
   run_pam_score(
     data = flow_tls_analysis_df,
     distance_matrix = combined_dist,
@@ -979,27 +1062,28 @@ run_flow_ja4 <- function(ja4_weight, ja4_version = c("ja4", "ja4_r")) {
 
 ```
 
-Block: Flow+JA4-Gewichtungsplot
-  Nutzt run_flow_ja4() für mehrere JA4-Gewichtungen
-  Visualisiert den Main-Cluster-F1 je Anwendung
-  Zeigt, wie sich die labelbasierte Clusterqualität mit steigendem JA4-Anteil verändert
-  Dient als Sensitivitätsanalyse der Gewichtung zwischen Flow- und TLS-Fingerprint-Merkmalen
-  Der Block setzt voraus, dass f1_plot_data vorher aus den gewünschten ja4_weights erzeugt wurde.
-```{r}
-ja4_weights <- seq(0, 1, by = 0.025)
+## 8. Gewichtungssweeps für Flow und JA4
 
+Die folgenden Blöcke berechnen den Main-Cluster-F1 für mehrere Gewichtungen und visualisieren die Sensitivität gegenüber dem TLS-Anteil der kombinierten Distanz.
+
+### 8.1 Flow+JA4-Gewichtungssweep
+
+```{r}
+# Prüft TLS-Gewichte von 0 bis 1 in Schritten von 0,025.
+ja4_weights <- seq(0, 1, by = 0.025)
+# für jedes ja4_weight wird ein run_flow_ja4 durchgeführt. wird in matrix gesammelt
 f1_plot_data_ja4 <- purrr::map_dfr(
   ja4_weights,
   ~ run_flow_ja4(.x, ja4_version = "ja4")
 )
-
+# berechnet durchschnitte
 f1_mean_data_ja4 <- f1_plot_data_ja4 %>%
   group_by(ja4_weight) %>%
   summarise(
     mean_f1 = mean(main_cluster_f1, na.rm = TRUE),
     .groups = "drop"
   )
-
+# Erstellt graphische darstellung der daten (nur kosmetisch, aendert nichts an daten)
 p_f1_flow_ja4_weight <- f1_plot_data_ja4 %>%
   ggplot(
     aes(
@@ -1064,24 +1148,28 @@ geom_line(
     panel.grid.minor = element_blank(),
     legend.position = "right"
   )
-
+# gibt plot aus
 p_f1_flow_ja4_weight
 ```
-```{r}
-ja4_weights <- seq(0, 1, by = 0.025)
 
+### 8.2 Flow+JA4_r-Gewichtungssweep
+
+```{r}
+# Prüft TLS-Gewichte von 0 bis 1 in Schritten von 0,025.
+ja4_weights <- seq(0, 1, by = 0.025)
+# für jedes ja4_weight wird ein run_flow_ja4r durchgeführt. wird in matrix gesammelt
 f1_plot_data_ja4r <- purrr::map_dfr(
   ja4_weights,
   ~ run_flow_ja4(.x, ja4_version = "ja4_r")
 )
-
+# berechnet durchschnitte
 f1_mean_data_ja4r <- f1_plot_data_ja4r %>%
   group_by(ja4_weight) %>%
   summarise(
     mean_f1 = mean(main_cluster_f1, na.rm = TRUE),
     .groups = "drop"
   )
-
+# Erstellt graphische darstellung der daten (nur kosmetisch, aendert nichts an daten)
 p_f1_flow_ja4r_weight <- f1_plot_data_ja4r %>%
   ggplot(
     aes(
@@ -1147,9 +1235,14 @@ geom_line(
     panel.grid.minor = element_blank(),
     legend.position = "right"
   )
-
+# gibt plot aus
 p_f1_flow_ja4r_weight
 ```
+
+
+## 9. JA3-Distanzfunktionen
+
+Die folgenden Hilfsfunktionen implementieren die tokenbasierte Levenshtein- und die abschnittsweise Jaccard-Distanz für JA3_full.
 
 ```{r}
 # ------------------------------------------------------------
@@ -1157,10 +1250,11 @@ p_f1_flow_ja4r_weight
 # Reihenfolge bleibt vollständig erhalten
 # ------------------------------------------------------------
 
+# Zerlegt einen JA3-Abschnitt in seine TLS-Token, ohne deren Reihenfolge zu verändern.
 split_ja3_section_tokens <- function(section_value, section_index) {
   
   section_value <- as.character(section_value)
-  
+  # Fehler verwerfen
   if (
     is.na(section_value) ||
     section_value == "" ||
@@ -1174,24 +1268,21 @@ split_ja3_section_tokens <- function(section_value, section_index) {
   if (section_index == 1) {
     return(section_value)
   }
-  
+  # Andernfalls JA3 am bindestrich in bestandteile zerleben
   tokens <- strsplit(
     section_value,
     split = "-",
     fixed = TRUE
   )[[1]]
-  
+  # leerzeichen entfernen/leere token entferen
   tokens <- trimws(tokens)
   tokens[tokens != ""]
 }
 
-# ------------------------------------------------------------
-# Tokenfolgen für adist kodieren
-# Jeder TLS-Wert wird zu genau einem Zeichen
-# ------------------------------------------------------------
-
+# -----------------------------------------------------------------------------
+# Kodiert TLS-Token als einzelne Unicode-Zeichen für die tokenbasierte Levenshtein-Distanz.
 encode_token_sequences <- function(token_sequences) {
-  
+  # Jeden token nur einmal verwenden, zu Vokabular zusammenfassen
   vocabulary <- unique(
     unlist(token_sequences, use.names = FALSE)
   )
@@ -1199,11 +1290,13 @@ encode_token_sequences <- function(token_sequences) {
   if (length(vocabulary) == 0) {
     return(rep("", length(token_sequences)))
   }
-  
+  # vermeidet fehler
   if (length(vocabulary) > 6000) {
-    stop("Zu viele unterschiedliche Tokens für die interne Kodierung.")
+    stop("Zu viele unterschiedliche Tokens")
   }
-  
+  # Jedem Token ein eindeutiges Unicode-Zeichen zuweisen
+  # Heino et al. war nicht 100% eindeutig aber so wurde es im Rahmen dieser Arbeit verstanden:
+  # Hintergedante: Wir verwenden so oder so nicht mehr den eigendlichen datentypen (Binärwerte) sondern deren dezimaldarstellung. also macht es keinen sinn Levenstein in der CipherSuite/Extention/etc. durchzuführen da es nicht mehr gleiche werte erzeugen würde (unabhängig davon sind die werte kennzahlen, d.h. 0x0001 wäre auch nicht näher an 0x0002 als 0xFFFF. daher macht es mehr sinn levenstein auf einerer tieferen ebene anzuwenden. damit man einfach vergleichen kann bekommt jeder part des vokabulars seinen eigenen Unicode wert. Eine abweichung entspricht dann einem TLS-Parametereintrag. das zeichen selbst bedeutet nichts, macht nur den rest einfacher)
   token_characters <- vapply(
     seq_along(vocabulary),
     function(i) intToUtf8(0xE000 + i - 1),
@@ -1214,7 +1307,7 @@ encode_token_sequences <- function(token_sequences) {
     token_characters,
     vocabulary
   )
-  
+  # Jedes Token wird durch sein zugeordnetes Zeichen ersetzt.
   vapply(
     token_sequences,
     function(tokens) {
@@ -1231,55 +1324,52 @@ encode_token_sequences <- function(token_sequences) {
   )
 }
 
-# ------------------------------------------------------------
-# Tokenbasierte Levenshtein-Distanz nach Heino
-# KEINE Sortierung
-# ------------------------------------------------------------
-
+# -----------------------------------------------------------------------------
+# Berechnet die abschnittsweise Levenshtein-Distanz zwischen JA3_full-Werten.
 make_ja3_levenshtein_distance <- function(
     data,
     ja3_col = "ja3_full"
 ) {
-  
+  # prüft ob JA3-Spalte im Datensatz vorhanden ist
   if (!(ja3_col %in% names(data))) {
     stop(paste("Spalte fehlt:", ja3_col))
   }
-  
+  # JA3-Fingerprints als Zeichenkette
   ja3_values <- as.character(data[[ja3_col]])
+  # nur unterschiedliche berechnen
   unique_ja3_values <- unique(ja3_values)
-  
+  #  JA3-Fingerprints in ihre einzelnen Bestandteile zerlegen
   section_matrix <- split_ja3_full_sections(
     unique_ja3_values
   )
-  
+  # Distanzmatrix für die eindeutigen Fingerprints initialisieren
   unique_distance_matrix <- matrix(
     0,
     nrow = length(unique_ja3_values),
     ncol = length(unique_ja3_values)
   )
-  
+  # Sektionen seperat vergleichen. Gesamtdistanz ist die summe der abschnitte 
   for (section_index in seq_len(ncol(section_matrix))) {
-    
+    # Abschnitt in Tokenfolgen zerlegen
     token_sequences <- lapply(
       section_matrix[, section_index],
       split_ja3_section_tokens,
       section_index = section_index
     )
-    
+    # Codieren der Tokenfolge als Unicodezeichen
     encoded_sequences <- encode_token_sequences(
       token_sequences
     )
-    
+    # für jedes paar die Levenshtein-Distanzen berechnen
     section_distance <- utils::adist(
       encoded_sequences,
       useBytes = FALSE
     )
-    
+    # Auf alle beobachtungen erweitern. Verbindungen können wieder mehrfach vorkommen
     unique_distance_matrix <-
       unique_distance_matrix +
       section_distance
   }
-  
   observation_index <- match(
     ja3_values,
     unique_ja3_values
@@ -1290,25 +1380,24 @@ make_ja3_levenshtein_distance <- function(
     observation_index,
     drop = FALSE
   ]
-  
+  # Distanz einer Beobachtung zu sich selbst auf 0 setzen
   diag(complete_distance_matrix) <- 0
-  
+  # als dist zurueckgeben
   as.dist(complete_distance_matrix)
 }
 
 # ------------------------------------------------------------
 # Jaccard-Distanz für einen JA3-Abschnitt
-# Reihenfolge wird bewusst ignoriert
 # ------------------------------------------------------------
-
+# Berechnet die Jaccard-Distanzmatrix für die Tokenmengen eines JA3-Abschnitts.
 make_section_jaccard_matrix <- function(token_sets) {
-  
+  # Gesamtes Vokabular aller vorkommenden Tokens bestimmen
   vocabulary <- unique(
     unlist(token_sets, use.names = FALSE)
   )
-  
+  # Anzahl der Beobachtungen bestimmen
   observation_count <- length(token_sets)
-  
+  # Fehlerbehandlung wenn keine token
   if (length(vocabulary) == 0) {
     return(
       matrix(
@@ -1318,111 +1407,111 @@ make_section_jaccard_matrix <- function(token_sets) {
       )
     )
   }
-  
+  # tokenmatrix erstellen. Zeilen sind Beobachtungen; Spalten sind Token; Wenn 1 vorhanden wenn 0 nicht vorhanden
   token_matrix <- matrix(
     0,
     nrow = observation_count,
     ncol = length(vocabulary),
     dimnames = list(NULL, vocabulary)
   )
-  
+  # vorhandene Tokens jeder Beobachtung markieren
   for (i in seq_along(token_sets)) {
-    
+    # Doppelte Tokens entfernen, da es sich um Mengen handelt. Objekte in einer Menge sind einzigartig
     current_tokens <- unique(token_sets[[i]])
     
     if (length(current_tokens) > 0) {
       token_matrix[i, current_tokens] <- 1
     }
   }
-  
+  # Anzahl gemeinsamer Tokens 
   intersection_matrix <- tcrossprod(token_matrix)
+  # Anzahl der Tokens pro Beobachtung
   token_counts <- rowSums(token_matrix)
-  
+  # Vereinigungsmenge bestimmtn
   union_matrix <-
     outer(token_counts, token_counts, FUN = "+") -
     intersection_matrix
-  
+  # Distanzmatrix erstellen
   distance_matrix <- matrix(
     0,
     nrow = observation_count,
     ncol = observation_count
   )
-  
+  # nur tokenpaare mit min 1 berücksichtigen
   valid_pairs <- union_matrix > 0
-  
+  # Jaccard-Ähnlichkeit bestimmen und zu distanz verrechnen
   distance_matrix[valid_pairs] <-
     1 -
     intersection_matrix[valid_pairs] /
     union_matrix[valid_pairs]
-  
+  # distaz zu sich selbst ist 0
   diag(distance_matrix) <- 0
-  
+  # Rückgabe
   distance_matrix
 }
-
 # ------------------------------------------------------------
-# Abschnittsweise Jaccard-Distanz
-# Reihenfolge der Extensions wird ignoriert
-# ------------------------------------------------------------
-
+# Summiert die Jaccard-Distanzen der einzelnen JA3-Abschnitte.
 make_ja3_jaccard_distance <- function(
     data,
     ja3_col = "ja3_full"
 ) {
-  
+  # ist JA3-Spalte im Datensatz vorhanden 
   if (!(ja3_col %in% names(data))) {
     stop(paste("Spalte fehlt:", ja3_col))
   }
-  
+  # als zeichenkette, nur einzigartige
   ja3_values <- as.character(data[[ja3_col]])
   unique_ja3_values <- unique(ja3_values)
-  
+  # JA3-Fingerprints in abschnitte aufgeilen
   section_matrix <- split_ja3_full_sections(
     unique_ja3_values
   )
-  
+  # matrix initialisieren
   unique_distance_matrix <- matrix(
     0,
     nrow = length(unique_ja3_values),
     ncol = length(unique_ja3_values)
   )
-  
+  # Gesammtdistanz aus allen abschnitten bestimmen
   for (section_index in seq_len(ncol(section_matrix))) {
-    
+    # Aktuellen Abschnitt in Tokenmengen umwandeln
     token_sets <- lapply(
       section_matrix[, section_index],
       split_ja3_section_tokens,
       section_index = section_index
     )
-    
+    # Jaccard-Distanz für die aktuellen Abschnitt berechnen
     section_distance <- make_section_jaccard_matrix(
       token_sets
     )
-    
+    # zur gesammtmatrix
     unique_distance_matrix <-
       unique_distance_matrix +
       section_distance
   }
-  
+  # wieder auf ursprünglichen datensatz erweitern. Beobachtungen können wieder mehrfach vorkommen 
   observation_index <- match(
     ja3_values,
     unique_ja3_values
   )
-  
   complete_distance_matrix <- unique_distance_matrix[
     observation_index,
     observation_index,
     drop = FALSE
   ]
-  
+  # distanz zu sich selbst immer 0
   diag(complete_distance_matrix) <- 0
-  
+  # zurueckgeben
   as.dist(complete_distance_matrix)
 }
 
 ```
 
+
+## 10. JA3-only-Auswertung
+
 ```{r}
+# Feste Reihenfolge der fünf Bestandteile eines JA3_full-Werts.
 ja3_section_names <- c(
   "tls_version",
   "cipher_suites",
@@ -1431,46 +1520,48 @@ ja3_section_names <- c(
   "ec_point_formats"
 )
 
+# -----------------------------------------------------------------------------
+# Zerlegt JA3_full-Werte 
 split_ja3_full_sections <- function(ja3_values) {
   
   parsed_sections <- lapply(
     as.character(ja3_values),
     function(current_ja3) {
-      
+      # trennt anhand des kommas
       parts <- strsplit(
         current_ja3,
         split = ",",
         fixed = TRUE
       )[[1]]
-      
+      #  wert besteht immer aus genau 5 abschnitten
       if (length(parts) > 5) {
         stop(
           paste0(
-            "Ungültiger JA3_full-Wert mit mehr als fünf Abschnitten: ",
+            "Ungültiger JA3_full-Wert mit mehr als fünf Abschnitten",
             current_ja3
           )
         )
       }
-      
       parts <- c(
         parts,
         rep("", 5 - length(parts))
       )
-      
+      # leerzeichen entfehren 
       trimws(parts)
     }
   )
-  
+  # Einzelne Fingerprints in einer Matrix zusammenfügen
   section_matrix <- do.call(
     rbind,
     parsed_sections
   )
-  
+  # Spaltennamen setzen
   colnames(section_matrix) <- ja3_section_names
   
   section_matrix
 }
 
+# Bereitet den unbalancierten JA3-only-Datensatz vor.
 ja3_analysis_df <- prepare_analysis_data(
   input_file = input_file,
   selected_endpoint_filter = selected_endpoint_filter,
@@ -1478,17 +1569,19 @@ ja3_analysis_df <- prepare_analysis_data(
   flow_features = flow_features,
   extra_cols = "ja3_full",
   # -------------------- Hinweis
-  # für unbalanciert hier balance = FALSE
+  # für unbalanciert balance = FALSE
   # --------------------
-  balance = FALSE
+  balance = TRUE
 )
 
+# -----------------------------------------------------------------------------
+# Führt die JA3-only Auswertung wahlweise mit Levenshtein oder Jaccard-Distanz aus
 run_ja3_full <- function(
     distance_method = c("levenshtein", "jaccard")
 ) {
-  
+  # eine distanzmetode möglich
   distance_method <- match.arg(distance_method)
-  
+  # switch statement legt ausgefuehrte funktion fest
   ja3_distance <- switch(
     distance_method,
     
@@ -1502,7 +1595,7 @@ run_ja3_full <- function(
       ja3_col = "ja3_full"
     )
   )
-  
+  # PAM auswertung und Scoreberechung wird ausgefuehrt, tabelle wird um methode erweitert
   run_pam_score(
     data = ja3_analysis_df,
     distance_matrix = ja3_distance,
@@ -1520,12 +1613,14 @@ run_ja3_full <- function(
     )
 }
 
+# Schnellfunktion für run_ja3_full() mit Jaccard-Distanz.
 run_ja3_jaccard <- function() {
   run_ja3_full(
     distance_method = "jaccard"
   )
 }
 
+# Schnellfunktion für run_ja3_full() mit Levenshtein-Distanz.
 run_ja3_levenshtein <- function() {
   run_ja3_full(
     distance_method = "levenshtein"
@@ -1536,6 +1631,7 @@ run_ja3_levenshtein <- function() {
 
 
 ```{r}
+# Führt die JA3-only-Auswertung mit Jaccard-Distanz aus.
 label_result_table_ja3_jaccard <- run_ja3_jaccard()
 
 label_result_table_ja3_jaccard
@@ -1544,18 +1640,23 @@ mean(label_result_table_ja3_jaccard$main_cluster_f1, na.rm = TRUE)
 ```
 
 ```{r}
+# Führt die JA3-only-Auswertung mit Levenshtein-Distanz aus.
 label_result_table_ja3_levenshtein <- run_ja3_levenshtein()
 
 label_result_table_ja3_levenshtein
 mean(label_result_table_ja3_levenshtein$main_cluster_f1, na.rm = TRUE)
 
 ```
+
+## 11. Kombination von Flow- und JA3-Distanzen
+
 ```{r}
 # ------------------------------------------------------------
 # Flow + JA3: zusätzlicher, unabhängiger Kombinationsblock
-# Der bestehende JA4-/JA4_r-Code bleibt unverändert.
+# Dieser Block ist unabhängig von der vorherigen JA4-/JA4_r-Auswertung.
 # ------------------------------------------------------------
 
+# Gemeinsamer Datensatz für Flow+JA3.
 flow_ja3_analysis_df <- prepare_analysis_data(
   input_file = input_file,
   selected_endpoint_filter = selected_endpoint_filter,
@@ -1563,12 +1664,13 @@ flow_ja3_analysis_df <- prepare_analysis_data(
   flow_features = flow_features,
   extra_cols = "ja3_full",
   # -------------------- Hinweis
-  # für unbalanciert hier balance = FALSE
+  # für unbalanciert balance = FALSE
   # --------------------
-  balance = TRUE
+  balance = FALSE
 )
 
-# Flow-Distanz
+# Flow-Distanz für den gemeinsamen Flow+JA3-Datensatz.
+# Berechnet und normalisiert die Flow-Distanz einmalig für beide JA3-Varianten.
 flow_ja3_flow_dist <- make_flow_distance(
   flow_ja3_analysis_df
 )
@@ -1580,7 +1682,8 @@ flow_ja3_flow_matrix <- as.matrix(
   )
 )
 
-# JA3-Levenshtein-Distanz
+# JA3-Levenshtein-Distanz für denselben Datensatz.
+# Berechnet und normalisiert die JA3-Levenshtein-Distanz einmalig.
 flow_ja3_levenshtein_dist <- make_ja3_levenshtein_distance(
   data = flow_ja3_analysis_df,
   ja3_col = "ja3_full"
@@ -1593,7 +1696,8 @@ flow_ja3_levenshtein_matrix <- as.matrix(
   )
 )
 
-# JA3-Jaccard-Distanz
+# JA3-Jaccard-Distanz für denselben Datensatz.
+# Berechnet und normalisiert die JA3-Jaccard-Distanz einmalig.
 flow_ja3_jaccard_dist <- make_ja3_jaccard_distance(
   data = flow_ja3_analysis_df,
   ja3_col = "ja3_full"
@@ -1606,10 +1710,7 @@ flow_ja3_jaccard_matrix <- as.matrix(
   )
 )
 
-# ------------------------------------------------------------
-# Flow + JA3 ausführen
-# ------------------------------------------------------------
-
+# -----------------------------------------------------------------------------
 run_flow_ja3 <- function(
     ja3_weight,
     ja3_version = c(
@@ -1653,6 +1754,9 @@ run_flow_ja3 <- function(
     )
 }
 ```
+
+
+### 11.1 Flow+JA3-Levenshtein-Gewichtungssweep
 
 ```{r}
 ja3_weights <- seq(0, 1, by = 0.025)
@@ -1725,6 +1829,9 @@ p_f1_flow_ja3_levenshtein_weight <- f1_plot_data_ja3_levenshtein %>%
 p_f1_flow_ja3_levenshtein_weight
 ```
 
+
+### 11.2 Flow+JA3-Jaccard-Gewichtungssweep
+
 ```{r}
 ja3_weights <- seq(0, 1, by = 0.025)
 
@@ -1796,8 +1903,13 @@ p_f1_flow_ja3_jaccard_weight <- f1_plot_data_ja3_jaccard %>%
 p_f1_flow_ja3_jaccard_weight
 ```
 
+
+## 12. Ausgewählte Ergebniswerte
+
 ```{r}
 
+# Gibt die ausgewählten Ergebniswerte für die in der Arbeit verwendeten
+# Gewichtungen der kombinierten JA4- und JA4_r-Auswertung aus.
 table_flow_ja4 <- run_flow_ja4(
   0.175,
   ja4_version = "ja4"
