@@ -4,7 +4,7 @@
 Die Anwendung benötigt entweder:
 
 die rohen korrelierten TCP-Flow-JSON-Daten. In diesem Fall muss zunächst der Codeblock „0. Alle Daten zu CSV zusammenfügen“ ausgeführt werden. Hierfür ist der Quellpfad entsprechend anzupassen.
-oder die bereits erzeugte CSV-Datei aus dem Ordner Daten dieses Repositories (nach dem Entpacken).
+oder die bereits erzeugte CSV-Datei aus dem Ordner Daten dieses Repositories (nach dem Entpacken). In beiden Fällen müssen die jeweiligen Pfade angepasst werden
 
 Wird die bereitgestellte CSV-Datei verwendet, kann der Codeblock „0. Alle Daten zu CSV zusammenfügen“ übersprungen werden.
 
