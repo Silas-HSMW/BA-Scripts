@@ -35,3 +35,6 @@ Enthält den Vollständig aufbereiteten Datensatz
 
 ### dataset
 Das hier enthaltene Script wurde zur Erstellung des Datensatzes verwendet (Datenkorrelation)
+
+### Workflow
+Server Einrichten -> Daten Erstellen mit "createData" erstellen -> "dataset" nutzen um Rodaten im ersten schritt aufzuarbeiten -> R Skript nutzen um daten vollständig aufzuarbeiten und Daten zu analysieren
