@@ -9,7 +9,18 @@ oder die bereits erzeugte CSV-Datei aus dem Ordner Daten dieses Repositories (na
 Wird die bereitgestellte CSV-Datei verwendet, kann der Codeblock „0. Alle Daten zu CSV zusammenfügen“ übersprungen werden.
 
 Vor dem Ausführen des Codes muss R installiert und eingerichtet sein. Zusätzlich müssen die folgenden Bibliotheken installiert werden:
-
+```
+install.packages(c(
+  "tidyverse",
+  "cluster",
+  "purrr",
+  "readr",
+  "dplyr",
+  "tidyr",
+  "stringr",
+  "ggplot2"
+))
+```
 
 ### Ungefilterter Datensatz
 
