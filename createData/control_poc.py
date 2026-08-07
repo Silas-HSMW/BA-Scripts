@@ -30,6 +30,8 @@ SERVERS = [
             "browser": [
                 "",
                 "/heavy.html",
+                "/assets/img-small.bin",
+                "/assets/img-large.bin",
             ],
             "simple": [
                 "",
@@ -48,6 +50,8 @@ SERVERS = [
             "browser": [
                 "",
                 "/heavy.html",
+                "/assets/img-small.bin",
+                "/assets/img-large.bin",
             ],
             "simple": [
                 "",
