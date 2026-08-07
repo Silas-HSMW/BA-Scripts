@@ -1,7 +1,7 @@
 # Übersicht des Bachelor-Repository zu "Möglichkeiten und Grenzen des TLS-Fingerprinting in der Analyse serverseitig erhobener Netzwerkkommunikation"
 
 ### Verwendete Versionen
-*Python Version:*
+*Python Version (Datenaufbereitung):*
 python 3.14
 
 *R Version:* 
