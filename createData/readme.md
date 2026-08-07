@@ -63,4 +63,4 @@ Chrome:
 `pip install requests urllib3`
 #### Control_poc.py
 1. CLIENT_ID entsprechend festlegen (eindeutiger Name)
-2. Server mit Namen, Port, IPs und Endpunkten festlegen
+2. Server mit Namen, Port, IPs und Endpunkten festlegen (WICHTIG: der Name muss auch erreichbar sein! Da Server nicht von DNS-Server aufgelöst werden entsprechende configuration an der hostdateien der clients vornehmen
